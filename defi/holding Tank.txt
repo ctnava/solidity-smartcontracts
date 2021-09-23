@@ -1,0 +1,133 @@
+//Contract based on https://docs.openzeppelin.com/contracts/3.x/erc721
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "./CuneiformToken.sol";
+
+contract BoxOffice is Ownable {
+    event NewTicket(uint newTicketId);
+    event DebugPrice(uint pricex);
+    
+    CuneiformToken internal _minter;
+    
+    struct PaymentMethod {
+        ERC20 token;
+        AggregatorV3Interface priceFeed; }
+    mapping(uint => PaymentMethod) internal _paymentMethod;
+    uint public _paymentMethodIds;
+    
+    mapping(uint => uint[4]) internal _seriesPrices; // [souvenir, basic, premium, advanced] IN PENNIES
+    uint public _seriesIds;
+    
+    constructor(address minter) { 
+        //Rinkeby
+        address usdc = (0x4DBCdF9B62e891a7cec5A2568C3F4FAF9E8Abe2b); // (Source: https://app.compound.finance/)
+        address usdc_usd = (0xa24de01df22b63d23Ebc1882a5E3d4ec0d907bFB);
+        addPaymentMethod(usdc, usdc_usd);
+        address weth = (0xc778417E063141139Fce010982780140Aa0cD5Ab); // (Source: https://app.uniswap.org/#/swap)
+        address eth_usd = (0x8A753747A1Fa494EC906cE90E9f37563A8AF630e);
+        addPaymentMethod(weth, eth_usd); 
+        address wbtc = (0x577D296678535e4903D59A4C929B718e1D575e0A); // (Source: https://app.uniswap.org/#/swap)
+        address btc_usd = (0xECe365B379E1dD183B20fc5f022230C044d51404);
+        addPaymentMethod(wbtc, btc_usd); 
+        address link = (0x01BE23585060835E02B77ef475b0Cc51aA1e0709); // (Source: https://rinkeby.chain.link/)
+        address link_usd = (0xd8bD0a1cB028a31AA859A21A3758685a95dE4623);
+        addPaymentMethod(link, link_usd );
+        address dai = (0x5592EC0cfb4dbc12D3aB100b257153436a1f0FEa); // (Source: https://app.compound.finance/)
+        address dai_usd = (0x2bA49Aaa16E6afD2a993473cfB70Fa8559B523cF);
+        addPaymentMethod(dai, dai_usd); 
+        
+        addSeries(50, 101, 299, 999);
+        addSeries(69, 420, 42069, 69420);
+        addSeries(1, 2, 3, 4);
+        
+        _minter = CuneiformToken(minter); } 
+    
+    /**
+     * @dev Adding more failsafes would cause needless bloating, just be careful
+     */ 
+    function method_(uint methodId) internal view returns(PaymentMethod memory) { return (_paymentMethod[methodId]); }  
+    function _method(uint methodId) public view returns(address, address) { return(address(method_(methodId).token), address(method_(methodId).priceFeed)); }  
+    function _methodName(uint methodId) public view returns(string memory) { return (method_(methodId).token.name()); }
+    function _methodFeed(uint methodId) public view returns(address) { return (address(method_(methodId).priceFeed)); } 
+    function addPaymentMethod(address tokenAddress, address priceFeedAddress) public onlyOwner returns(uint) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(priceFeedAddress);
+        require(priceFeed.decimals() == 8, "ERROR: XXX_USD Pair Required");
+        ERC20 token = ERC20(tokenAddress);
+        _paymentMethodIds++;
+        _paymentMethod[_paymentMethodIds] = PaymentMethod(token, priceFeed);
+        return _paymentMethodIds; }
+    function updatePaymentMethod(uint methodId, address tokenAddress, address priceFeedAddress) public onlyOwner returns(bool) { 
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(priceFeedAddress);
+        require(priceFeed.decimals() == 8, "ERROR: XXX_USD Pair Required");
+        ERC20 token = ERC20(tokenAddress);
+        _paymentMethod[methodId] = PaymentMethod(token, priceFeed);
+        address methodToken;
+        address methodFeed; 
+        (methodToken, methodFeed) = _method(methodId);
+        return (methodToken == tokenAddress && methodFeed == priceFeedAddress); }
+    
+    /**
+     * @dev All prices are in pennies
+     */ 
+    function _prices(uint seriesId) public view returns(uint[4] memory) { return _seriesPrices[seriesId]; }
+    function _price(uint seriesId, uint nftType) public view returns(uint) { return _seriesPrices[seriesId][nftType]; }
+    function addSeries(uint souvenir, uint standard, uint premium, uint deluxe) public onlyOwner returns(uint, uint, uint, uint, uint) { 
+        _seriesIds++;
+        _seriesPrices[_seriesIds] = [souvenir, standard, premium, deluxe];
+        return (_seriesPrices[_seriesIds].length, _seriesPrices[_seriesIds][0], _seriesPrices[_seriesIds][1], _seriesPrices[_seriesIds][2], _seriesPrices[_seriesIds][3]); }
+    function updateSeries(uint seriesId, uint souvenir, uint standard, uint premium, uint deluxe) public onlyOwner returns(bool) { 
+        _seriesPrices[seriesId] = [souvenir, standard, premium, deluxe];
+        return (_seriesPrices[seriesId][0] == souvenir && _seriesPrices[seriesId][1] == standard && _seriesPrices[seriesId][2] == premium && _seriesPrices[seriesId][3] == deluxe); }
+    
+    /**
+     * @dev automagical fuckery
+     */ 
+    function getRequiredValue_(uint seriesId, uint nftType, PaymentMethod memory thisMethod) internal view returns(uint) {
+        require(seriesId > 0 && seriesId <= _seriesIds, "ERROR: Invalid seriesId");
+        require(nftType >= 0 && nftType <= 3, "ERROR: Invalid nftType");
+        ERC20 token = thisMethod.token; 
+        uint pennyValue = _price(seriesId, nftType); 
+        (, int price,,,) = thisMethod.priceFeed.latestRoundData();
+        
+        uint usdRawPrice = uint(price);
+        uint usdExp = 10 ** 8;
+        uint usdExp_squared = usdExp ** 2;
+        
+        uint usdRawPrice_squared = usdRawPrice ** 2;
+        uint tokenExp = 10 ** token.decimals(); 
+        uint tokenExp_usdExp = tokenExp/usdExp;
+    
+        uint usdXtokenExp = usdRawPrice * tokenExp_usdExp;    
+        uint usdXtokenExp_squaredXusdExp_squared = usdXtokenExp * usdExp_squared; 
+        uint tokenPerDollar = usdXtokenExp_squaredXusdExp_squared/usdRawPrice_squared;
+        uint tokenPerHundredAsset = pennyValue * tokenPerDollar;
+        uint tokenPerAsset = tokenPerHundredAsset/100;
+        return  tokenPerAsset; }
+    function _getRequiredValue(uint seriesId, uint nftType, uint methodId) public view returns(uint) { 
+        return (getRequiredValue_(seriesId, nftType, method_(methodId))); }
+    
+    /** 
+     * @dev Trustless Purchasing
+     */ 
+    function purchase(uint seriesId, uint nftType, uint methodId) public returns(uint) {
+        ERC20 token = method_(methodId).token; 
+        uint rawTokenValue = _getRequiredValue(seriesId, nftType, methodId);
+        require(token.allowance(msg.sender, address(this)) >= rawTokenValue && token.balanceOf(msg.sender) >= rawTokenValue, "ERROR: Insufficient Balance/Allowance");
+        uint ticketId = _minter.issueTicket(msg.sender, seriesId, nftType);
+        emit NewTicket(ticketId);
+        return ticketId; }  
+    
+    /** 
+     * @dev Trustless Purchasing
+     */ 
+    function withdraw(uint index) public onlyOwner { method_(index).token.transferFrom(address(this), owner(), method_(index).token.balanceOf(address(this))); }
+    function withdrawAll() public onlyOwner { 
+        for(uint i = 1; i <= _paymentMethodIds; i++) { 
+            ERC20 token = method_(i).token;
+            if(token.balanceOf(address(this)) > 0) {
+                token.transferFrom(address(this), owner(), token.balanceOf(address(this))); } } }
+}
